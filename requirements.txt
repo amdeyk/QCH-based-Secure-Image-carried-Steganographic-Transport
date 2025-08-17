@@ -18,3 +18,4 @@ timm>=0.9.0  # PyTorch image models
 transformers>=4.30.0  # Hugging Face transformers
 triton>=2.0.0  # For Flash Attention
 einops>=0.6.0  # For tensor operations
+psutil>=5.9.0
