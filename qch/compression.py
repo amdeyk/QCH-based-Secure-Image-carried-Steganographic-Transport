@@ -3,13 +3,19 @@ import json
 import lzma
 import os
 import struct
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 try:
     import zstandard as zstd
     HAVE_ZSTD = True
 except Exception:  # pragma: no cover - optional dependency
     HAVE_ZSTD = False
+
+try:
+    from .neural_compression import NeuralCompressor, CompressionConfig
+    HAVE_NEURAL = True
+except Exception:
+    HAVE_NEURAL = False
 
 from .utils import now_ts
 
@@ -43,8 +49,12 @@ def pack_files(paths: List[str], logger) -> bytes:
     return raw
 
 
-def compress_bytes(raw: bytes, method: str, level: int, logger) -> Tuple[str, bytes]:
+def compress_bytes(raw: bytes, method: str, level: int, logger, model_path: Optional[str] = None) -> Tuple[str, bytes]:
     method = (method or "lzma").lower()
+    if method == "neural" and HAVE_NEURAL:
+        compressor = NeuralCompressor(model_path=model_path)
+        out = compressor.compress(raw, logger)
+        return "neural", out
     if method == "zstd" and HAVE_ZSTD:
         c = zstd.ZstdCompressor(level=level if level else 10)
         out = c.compress(raw)
@@ -59,7 +69,11 @@ def compress_bytes(raw: bytes, method: str, level: int, logger) -> Tuple[str, by
     return "lzma", out
 
 
-def decompress_bytes(tag: str, comp: bytes, logger) -> bytes:
+def decompress_bytes(tag: str, comp: bytes, logger, model_path: Optional[str] = None) -> bytes:
+    if tag == "neural" and HAVE_NEURAL:
+        decompressor = NeuralCompressor(model_path=model_path)
+        out = decompressor.decompress(comp, logger)
+        return out
     if tag == "zstd" and HAVE_ZSTD:
         d = zstd.ZstdDecompressor()
         out = d.decompress(comp)
