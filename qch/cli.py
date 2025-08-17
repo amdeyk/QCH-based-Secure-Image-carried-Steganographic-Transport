@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import struct
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from PIL import Image
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -22,6 +22,9 @@ from .logger import setup_logger
 from .redundancy import xor_parity
 from .stego import embed_one, extract_one
 from .utils import b64d, sha256
+from .hardware_accel import HardwareAccelerator
+from .advanced_redundancy import HybridRedundancy
+from .quantum_crypto import quantum_encrypt, quantum_decrypt, QuantumCrypto
 
 
 # ----- Commands -----
@@ -36,6 +39,18 @@ def cmd_init_keys(args) -> None:
     write_public_key(os.path.join(args.out_dir, "qch_ed25519_public.pem"), pub)
     logger.info("[END] INIT-KEYS done.")
 
+
+def cmd_init_quantum_keys(args) -> None:
+    logger, xid = setup_logger(args.verbose)
+    logger.info(f"[START] INIT-QUANTUM-KEYS xid={xid}")
+    qc = QuantumCrypto()
+    public_key, secret_key = qc.generate_keypair()
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "quantum_public.key"), "wb") as f:
+        f.write(public_key)
+    with open(os.path.join(args.out_dir, "quantum_secret.key"), "wb") as f:
+        f.write(secret_key)
+    logger.info("[END] INIT-QUANTUM-KEYS done.")
 
 def embed_slices(args, cfg: QCHConfig, ct: bytes, meta: dict, logger):
     half = len(ct) // 2
@@ -70,6 +85,39 @@ def embed_slices(args, cfg: QCHConfig, ct: bytes, meta: dict, logger):
         logger.info(f"[EMBED] Wrote {pathA} / {pathB}")
 
 
+# Adaptive embedding using neural guidance
+def embed_slices_adaptive(args, cfg: QCHConfig, ct: bytes, meta: dict, logger, embedder):
+    half = len(ct) // 2
+    ov = int(half * cfg.overlap_ratio)
+    sliceA = ct[: half + ov]
+    sliceB = ct[half - ov :]
+    replicas = max(1, args.replicas)
+    groups_A = [sliceA for _ in range(replicas)]
+    groups_B = [sliceB for _ in range(replicas)]
+    if args.xor_parity:
+        parityA = xor_parity(groups_A)
+        parityB = xor_parity(groups_B)
+        groups_A.append(parityA)
+        groups_B.append(parityB)
+        logger.info("[REDUNDANCY] Added XOR parity replica (can recover 1 missing replica).")
+    total_reps = len(groups_A)
+    os.makedirs(args.out_dir, exist_ok=True)
+    for r_id in range(total_reps):
+        coverA = build_mosaic_cover(args.cover_folder, cfg, logger)
+        coverB = build_mosaic_cover(args.cover_folder, cfg, logger)
+        blobA = build_embedded_blob(meta, args.scheme, r_id, 0, 2, groups_A[r_id])
+        blobB = build_embedded_blob(meta, args.scheme, r_id, 1, 2, groups_B[r_id])
+        seedA = b64d(meta["nonce_b64"]) + meta["run_id"].encode() + b"A" + struct.pack(">I", meta["timecode"]) + struct.pack(">I", r_id)
+        seedB = b64d(meta["nonce_b64"]) + meta["run_id"].encode() + b"B" + struct.pack(">I", meta["timecode"]) + struct.pack(">I", r_id)
+        imgA = embedder.adaptive_embed(coverA, blobA, args.scheme, cfg, seedA, logger)
+        imgB = embedder.adaptive_embed(coverB, blobB, args.scheme, cfg, seedB, logger)
+        tag = f"{meta['run_id']}_rep{r_id}"
+        pathA = os.path.join(args.out_dir, f"{tag}_A.png")
+        pathB = os.path.join(args.out_dir, f"{tag}_B.png")
+        imgA.save(pathA, optimize=True)
+        imgB.save(pathB, optimize=True)
+        logger.info(f"[EMBED] Wrote {pathA} / {pathB}")
+
 def cmd_send(args) -> None:
     logger, xid = setup_logger(args.verbose)
     cfg = QCHConfig(
@@ -80,10 +128,15 @@ def cmd_send(args) -> None:
         timestep_sec=args.timestep,
     )
     logger.info(
-        f"[START] SEND xid={xid} scheme={args.scheme} replicas={args.replicas} xor_parity={args.xor_parity}"
+        f"[START] SEND xid={xid} scheme={args.scheme} replicas={args.replicas} xor_parity={args.xor_parity} compress={args.compress}"
     )
     raw = pack_files(args.inputs, logger)
-    ctag, comp = compress_bytes(raw, args.compress, args.level, logger)
+    if args.compress == "neural":
+        ctag, comp = compress_bytes(raw, args.compress, args.level, logger, model_path=args.neural_model)
+    else:
+        ctag, comp = compress_bytes(raw, args.compress, args.level, logger)
+    if args.quantum:
+        logger.warning("[QUANTUM] Quantum encryption not yet implemented; using classical crypto.")
     priv = read_private_key(args.privkey)
     ct, meta = encrypt_and_sign(
         struct.pack(">I", len(ctag)) + ctag.encode("ascii") + comp,
@@ -93,7 +146,12 @@ def cmd_send(args) -> None:
         cfg,
         logger,
     )
-    embed_slices(args, cfg, ct, meta, logger)
+    if args.adaptive_embed:
+        from .adaptive_embedding import AdaptiveEmbedder
+        embedder = AdaptiveEmbedder(model_path=args.adaptive_model)
+        embed_slices_adaptive(args, cfg, ct, meta, logger, embedder)
+    else:
+        embed_slices(args, cfg, ct, meta, logger)
     logger.info("[END] SEND complete.")
 
 
@@ -186,11 +244,13 @@ def cmd_recv(args) -> None:
             break
     ct = a + b[join:] if join else a + b
     logger.info(f"[RECV] Reconstructed ciphertext; size={len(ct)} bytes")
+    if args.quantum:
+        logger.warning("[QUANTUM] Quantum decryption not yet implemented; using classical crypto.")
     pt = verify_and_decrypt(ct, meta_ref, args.passphrase, logger)
     tag_len = struct.unpack(">I", pt[:4])[0]
     ctag = pt[4 : 4 + tag_len].decode("ascii")
     comp = pt[4 + tag_len :]
-    raw = decompress_bytes(ctag, comp, logger)
+    raw = decompress_bytes(ctag, comp, logger, model_path=args.neural_model)
     out_dir = args.out_dir or f"qch_out_{meta_ref['run_id']}"
     unpack_files(raw, out_dir, logger)
     logger.info(f"[END] RECV done. Restored to: {out_dir}")
@@ -207,6 +267,11 @@ def build_cli() -> argparse.ArgumentParser:
     p_init.add_argument("-v", "--verbose", action="store_true")
     p_init.set_defaults(func=cmd_init_keys)
 
+    p_init_quantum = sub.add_parser("init-quantum-keys")
+    p_init_quantum.add_argument("--out-dir", default="qch_quantum_keys")
+    p_init_quantum.add_argument("-v", "--verbose", action="store_true")
+    p_init_quantum.set_defaults(func=cmd_init_quantum_keys)
+
     p_send = sub.add_parser("send")
     p_send.add_argument("--inputs", nargs="+", required=True)
     p_send.add_argument("--passphrase", required=True)
@@ -215,7 +280,15 @@ def build_cli() -> argparse.ArgumentParser:
     p_send.add_argument("--cover-folder")
     p_send.add_argument("--out-dir", default="qch_tx")
     p_send.add_argument("--scheme", choices=["pvd", "matrix", "interp", "lsb"], default="pvd")
-    p_send.add_argument("--compress", choices=["lzma", "zstd"], default="lzma")
+    p_send.add_argument("--compress", choices=["lzma", "zstd", "neural"], default="lzma")
+    p_send.add_argument("--neural-model")
+    p_send.add_argument("--adaptive-embed", action="store_true")
+    p_send.add_argument("--adaptive-model")
+    p_send.add_argument("--quantum", action="store_true")
+    p_send.add_argument("--quantum-pubkey")
+    p_send.add_argument("--fountain-codes", action="store_true")
+    p_send.add_argument("--neural-correction", action="store_true")
+    p_send.add_argument("--gpu-accel", action="store_true")
     p_send.add_argument("--level", type=int, help="Compression level")
     p_send.add_argument("--width", type=int, default=1920)
     p_send.add_argument("--height", type=int, default=1080)
@@ -231,6 +304,11 @@ def build_cli() -> argparse.ArgumentParser:
     p_recv.add_argument("--images", nargs="+", required=True)
     p_recv.add_argument("--passphrase", required=True)
     p_recv.add_argument("--out-dir")
+    p_recv.add_argument("--neural-model")
+    p_recv.add_argument("--quantum", action="store_true")
+    p_recv.add_argument("--quantum-privkey")
+    p_recv.add_argument("--neural-correction", action="store_true")
+    p_recv.add_argument("--gpu-accel", action="store_true")
     p_recv.add_argument("--width", type=int, default=1920)
     p_recv.add_argument("--height", type=int, default=1080)
     p_recv.add_argument("--bpc", type=int, default=2)
