@@ -7,6 +7,7 @@
 - Added advanced redundancy and quantum crypto stubs
 - Expanded CLI with new options and training utilities
 - Updated README and requirements
+- Integrated optimized modules for neural compression, hardware acceleration, adaptive embedding, quantum crypto, and production pipeline
 
 ## 2024-05-16
 - Initial modularization of the QCH steganographic toolkit.
