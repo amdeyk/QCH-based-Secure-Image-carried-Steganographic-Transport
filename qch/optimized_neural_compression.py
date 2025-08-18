@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import lzma
 import zstd
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import io
 from pathlib import Path
 
@@ -69,7 +69,7 @@ class OptimizedNeuralCompressor:
         if model_path and Path(model_path).exists():
             self.load_model(model_path)
         else:
-            self.model = LightweightVAE().to(self.device)
+            self.model = LightweightVAE(input_size=self.chunk_size).to(self.device)
 
     def _setup_device(self, device: str) -> torch.device:
         if device == "auto":
@@ -80,26 +80,42 @@ class OptimizedNeuralCompressor:
             return torch.device("cpu")
         return torch.device(device)
 
-    def _preprocess_data(self, data: bytes) -> torch.Tensor:
-        """Convert bytes to tensor chunks"""
+    def _preprocess_data(self, data: bytes) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Convert bytes to tensor chunks with deterministic padding"""
+        original_length = len(data)
         remainder = len(data) % self.chunk_size
         if remainder:
-            data += b"\x00" * (self.chunk_size - remainder)
+            pad_length = self.chunk_size - remainder
+            padding = bytes([(256 - pad_length + i) % 256 for i in range(pad_length)])
+            data = data + padding
+        else:
+            pad_length = 0
+            padding = b""
 
         arr = np.frombuffer(data, dtype=np.uint8)
         arr = arr.reshape(-1, self.chunk_size)
         tensor = torch.from_numpy(arr.astype(np.float32) / 255.0)
-        return tensor.to(self.device)
 
-    def _postprocess_data(self, tensor: torch.Tensor, original_length: int) -> bytes:
-        """Convert tensor back to bytes"""
-        arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
+        metadata = {
+            "original_length": original_length,
+            "pad_length": pad_length,
+            "padding_pattern": padding.hex() if padding else "",
+            "num_chunks": tensor.shape[0],
+            "chunk_size": self.chunk_size,
+        }
+
+        return tensor.to(self.device), metadata
+
+    def _postprocess_data(self, tensor: torch.Tensor, metadata: Dict[str, Any]) -> bytes:
+        """Convert tensor back to bytes using stored metadata"""
+        arr = torch.round(tensor * 255.0).clamp(0, 255).byte().cpu().numpy()
         data = arr.flatten().tobytes()
-        return data[:original_length]
+        if metadata["pad_length"] > 0:
+            data = data[:-metadata["pad_length"]]
+        return data[: metadata["original_length"]]
 
     def compress(self, data: bytes, logger=None, fallback_classical: bool = True) -> bytes:
         """Compress data with neural network + fallback"""
-        original_length = len(data)
 
         try:
             if self.model is None:
@@ -107,15 +123,17 @@ class OptimizedNeuralCompressor:
 
             self.model.eval()
             with torch.no_grad():
-                x = self._preprocess_data(data)
-                mu, logvar = self.model.encode(x)
-                mu_quantized = torch.round(mu * 127) / 127
+                x, metadata = self._preprocess_data(data)
+                mu, _ = self.model.encode(x)
+
+                # Use high-precision quantization
+                mu_quantized = torch.round(mu * 32767) / 32767
+                mu_quantized = mu_quantized.clamp(-1, 1)
 
                 compressed_dict = {
                     "mu": mu_quantized.cpu().numpy().astype(np.float16),
-                    "shape": x.shape,
-                    "original_length": original_length,
-                    "method": "neural",
+                    "metadata": np.array([metadata], dtype=object),
+                    "method": "neural_precision",
                 }
 
                 buffer = io.BytesIO()
@@ -150,8 +168,8 @@ class OptimizedNeuralCompressor:
         """Decompress data with automatic method detection"""
         try:
             buffer = io.BytesIO(compressed_data)
-            data_dict = np.load(buffer)
-            if "method" in data_dict and data_dict["method"] == "neural":
+            data_dict = np.load(buffer, allow_pickle=True)
+            if "method" in data_dict and data_dict["method"] == "neural_precision":
                 return self._decompress_neural(data_dict, logger)
             raise ValueError("Not neural compressed")
         except Exception:
@@ -176,9 +194,9 @@ class OptimizedNeuralCompressor:
         self.model.eval()
         with torch.no_grad():
             mu = torch.from_numpy(data_dict["mu"].astype(np.float32)).to(self.device)
-            original_length = int(data_dict["original_length"])
+            metadata = data_dict["metadata"].item()
             reconstructed = self.model.decode(mu)
-            result = self._postprocess_data(reconstructed, original_length)
+            result = self._postprocess_data(reconstructed, metadata)
             if logger:
                 logger.info(
                     f"[NEURAL] Decompressed {len(mu)} tensors -> {len(result)} bytes"
@@ -210,7 +228,7 @@ class OptimizedNeuralCompressor:
     def load_model(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
         self.chunk_size = checkpoint.get("chunk_size", 8192)
-        self.model = LightweightVAE().to(self.device)
+        self.model = LightweightVAE(input_size=self.chunk_size).to(self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 

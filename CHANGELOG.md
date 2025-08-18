@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2025-08-17
+- Improved neural compression precision with deterministic padding and 16-bit quantization
 - Added neural compression module and CLI integration
 - Added adaptive multi-scale embedding module
 - Introduced hardware acceleration helpers
